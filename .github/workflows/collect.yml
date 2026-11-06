@@ -1,0 +1,76 @@
+# Collect Rapid KL live bus positions every hour of operating time.
+#
+# WHY THESE CHOICES
+# - Hourly job that polls for ~55 min: GitHub's shortest cron is 5 min and scheduled runs
+#   can start late, so one long-running job per hour loses far less data than many tiny ones.
+# - Minute :07, not :00: everyone schedules on the hour, so :00 runs queue the longest.
+# - 22-23,0-14 UTC = 06:07-23:02 Malaysia time, when buses actually report positions.
+# - Data goes to a separate `data` branch: your code history stays clean and readable,
+#   and the data branch is itself public proof the collector has run for N weeks.
+# - The repo MUST be public: ~16 runner-hours/day is free on public repos but would burn
+#   a private repo's monthly quota in about two days.
+name: collect
+
+on:
+  schedule:
+    - cron: "7 22,23,0-14 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: collector
+  cancel-in-progress: false   # never kill a run that is mid-collection
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+
+  collect:
+    needs: test               # broken code never writes bad data
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -r requirements.txt
+
+      - name: Check out the data branch into ./data
+        run: |
+          if git ls-remote --exit-code --heads origin data >/dev/null; then
+            git fetch origin data
+            git worktree add -B data data origin/data
+          else
+            git worktree add --orphan -b data data
+          fi
+
+      - name: Snapshot static schedule (only saved when it changes)
+        run: python collector/fetch_static.py --out data
+        continue-on-error: true   # a schedule hiccup must not cost an hour of positions
+
+      - name: Collect live positions
+        run: python collector/collect.py --minutes 55 --out data
+        env:
+          ROUTES: ${{ vars.ROUTES }}   # optional allowlist, set in repo Settings > Variables
+
+      - name: Commit and push data
+        working-directory: data
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "nothing new"
+          else
+            git commit -q -m "data: $(TZ=Asia/Kuala_Lumpur date +%Y-%m-%dT%H:%M)"
+            git push origin data
+          fi
